@@ -1,221 +1,517 @@
-import streamlit as st
-import sqlite3
+import datetime
+import io
 import json
+import psycopg2
+import bcrypt
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
 
-st.set_page_config(page_title="حاسبة وقاعدة بيانات مستحضرات التجميل", layout="wide")
+# --- إعدادات الصفحة ---
+st.set_page_config(
+    page_title="Sliman Clinic - Staff Management & Security OS",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# --- إعداد قاعدة البيانات (SQLite) ---
-conn = sqlite3.connect("cosmetics_recipes.db", check_same_thread=False)
-cursor = conn.cursor()
+CLINIC_PHONE_NUMBER = st.secrets.get("CLINIC_PHONE", "+966500000000")
 
-# جدول حفظ الوصفات
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS recipes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        bottle_cost REAL,
-        electricity_cost REAL,
-        other_cost REAL,
-        oils_data TEXT,
-        total_cost REAL
-    )
-""")
+# --- إدارة الاتصال بقاعدة البيانات ---
+def get_db_connection():
+    return psycopg2.connect(st.secrets["postgres"]["url"])
 
-# جدول حفظ الزيوت والمواد المضافة حديثاً
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS custom_materials (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        size REAL,
-        price REAL
-    )
-""")
-conn.commit()
+# --- التشفير والتحقق من كلمات المرور باستخدام Bcrypt ---
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
-# --- المواد المجهزة مسبقاً (الافتراضية) ---
-DEFAULT_MATERIALS = {
-    "كريم أساس (קרם בסיס)": {"size": 1000, "price": 65},
-    "جل أساس (ג׳ל בסיס)": {"size": 1000, "price": 45},
-    "فيتامين E نباتي (ויטמין E)": {"size": 50, "price": 35},
-    "زيت الخروع (שמן קיק)": {"size": 20, "price": 15},
-    "زيت اللوز الصافي (שמן שקדים 20ml)": {"size": 20, "price": 15},
-    "زيت الأوبليبيخا (שמן אובליפיחה)": {"size": 10, "price": 25},
-    "سينرجيا التفتيح (סינرجיה הבהרה)": {"size": 20, "price": 40},
-    "زيت أرنيكا (ארניקה) - 500ml": {"size": 500, "price": 200},
-    "زيت سمسم (שומשום) - 500ml": {"size": 500, "price": 80},
-    "زيت بذور العنب (זרעי ענבים) - 500ml": {"size": 500, "price": 50},
-    "زيت جوجوبا (חוחובה) - 500ml": {"size": 500, "price": 160},
-    "زيت بذور المشمش (גלעיני משמש) - 500ml": {"size": 500, "price": 130},
-    "زيت اللوز (שקדים) - 500ml": {"size": 500, "price": 45},
-    "زيت إكليل الجبل (רוזמרין) - 10ml": {"size": 10, "price": 30},
-    "زيت كاجبوت (קג'פוט) - 10ml": {"size": 10, "price": 30},
-    "زيت زنجبيل (ג'נג'ر) - 10ml": {"size": 10, "price": 40},
-    "زيت فلفل أسود (פלפל שחור) - 10ml": {"size": 10, "price": 35},
-    "زيت جريب فروت (אשכולית) - 10ml": {"size": 10, "price": 25},
-    "زيت أوكالبتوس (אוקליפטוס) - 10ml": {"size": 10, "price": 25},
-    "زيت صنوبر (אורן) - 10ml": {"size": 10, "price": 25},
-    "زيت نعناع (מנטה) - 10ml": {"size": 10, "price": 25},
-    "زيت لافندر (לבנדר) - 10ml": {"size": 10, "price": 25},
-    "زيت برتقال (תפוז) - 10ml": {"size": 10, "price": 25},
-    "زيت يوسفي (מנדרינה) - 10ml": {"size": 10, "price": 25},
-    "زيت لبان (לבונה) - 10ml": {"size": 10, "price": 55},
-    "زيت جيرانيوم (גרניום) - 10ml": {"size": 10, "price": 45},
-}
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except Exception:
+        return False
 
-# جلب الزيوت المضافة من قاعدة البيانات ودمجها مع القائمة
-all_materials = {"-- اختر مادة جاهزة أو أدخل يدويًا --": None}
-all_materials.update(DEFAULT_MATERIALS)
+# --- سجل التتبع والرقابة الأمني (Audit Logging) ---
+def log_audit_action(user_name, role, action_description):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO audit_logs (user_name, user_role, action_description)
+            VALUES (%s, %s, %s);
+        """, (user_name, role, action_description))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
 
-cursor.execute("SELECT name, size, price FROM custom_materials")
-for row in cursor.fetchall():
-    all_materials[row[0]] = {"size": row[1], "price": row[2]}
+# --- تهيئة قواعد البيانات والجداول ---
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-st.title("🧪 حاسبة وقاعدة بيانات مستحضرات التجميل")
+    # 1. جدول حسابات الموظفين والكادر
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS staff_users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            full_name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
 
-if "oils" not in st.session_state:
-    st.session_state.oils = []
+    # 2. جدول سجل الرقابة والأمان Audit Logs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            user_name TEXT,
+            user_role TEXT,
+            action_description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
 
-# --- ➕ القائمة الجانبية: إضافة زيت جديد للقائمة الدائمة ---
-st.sidebar.header("➕ إضافة زيت جديد للقائمة الدائمة")
-with st.sidebar.form("add_new_material_form"):
-    new_mat_name = st.text_input("اسم الزيت / المادة الجديدة:")
-    new_mat_size = st.number_input("الحجم (مل / جرام):", min_value=0.1, value=10.0)
-    new_mat_price = st.number_input("سعر الشراء (₪):", min_value=0.0, value=30.0)
-    
-    save_mat_btn = st.form_submit_button("حفظ الزيت بالقائمة")
-    if save_mat_btn and new_mat_name:
-        try:
-            cursor.execute("INSERT OR REPLACE INTO custom_materials (name, size, price) VALUES (?, ?, ?)", 
-                           (new_mat_name, new_mat_size, new_mat_price))
-            conn.commit()
-            st.sidebar.success(f"تمت إضافة '{new_mat_name}' بنجاح!")
-            st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"خطأ في الحفظ: {e}")
+    # 3. جدول المتعالجين الموحد
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id SERIAL PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            phone TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
 
-st.sidebar.write("---")
+    # 4. جدول الغرف
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clinic_rooms (
+            id SERIAL PRIMARY KEY,
+            room_name TEXT UNIQUE,
+            room_type TEXT
+        );
+    """)
 
-# --- 📚 القائمة الجانبية: استرجاع الوصفات المحفوظة ---
-st.sidebar.header("📚 الوصفات المحفوظة")
-cursor.execute("SELECT name FROM recipes")
-saved_recipes = [row[0] for row in cursor.fetchall()]
-selected_recipe = st.sidebar.selectbox("اختر وصفة لاستعراضها:", ["-- جديد --"] + saved_recipes)
+    # 5. جدول المخزن
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_items (
+            id SERIAL PRIMARY KEY,
+            item_name TEXT UNIQUE,
+            quantity_available REAL,
+            unit TEXT,
+            cost_per_unit REAL DEFAULT 0.0
+        );
+    """)
 
-if selected_recipe != "-- جديد --" and st.sidebar.button("تحميل الوصفة"):
-    cursor.execute("SELECT * FROM recipes WHERE name = ?", (selected_recipe,))
-    recipe_data = cursor.fetchone()
-    if recipe_data:
-        st.session_state.load_name = recipe_data[1]
-        st.session_state.load_bottle = recipe_data[2]
-        st.session_state.load_elec = recipe_data[3]
-        st.session_state.load_other = recipe_data[4]
-        st.session_state.oils = json.loads(recipe_data[5])
+    # 6. جدول الجلسات
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clinic_sessions (
+            id SERIAL PRIMARY KEY,
+            client_id INT REFERENCES clients(id),
+            service_type TEXT,
+            therapist_name TEXT,
+            room_name TEXT,
+            price REAL DEFAULT 0.0,
+            cogs_cost REAL DEFAULT 0.0,
+            consent_signed BOOLEAN DEFAULT FALSE,
+            start_time TIMESTAMP,
+            end_time TIMESTAMP,
+            status TEXT DEFAULT 'مجدول'
+        );
+    """)
+
+    # 7. جدول SOAP Notes
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS soap_notes (
+            id SERIAL PRIMARY KEY,
+            session_id INT UNIQUE REFERENCES clinic_sessions(id),
+            subjective TEXT,
+            objective TEXT,
+            assessment TEXT,
+            plan TEXT,
+            is_locked BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    # 8. جدول النقاط التشريحية الذكية
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS body_pins (
+            id SERIAL PRIMARY KEY,
+            session_id INT REFERENCES clinic_sessions(id),
+            pin_type TEXT,
+            notes TEXT,
+            canvas_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    # إنشاء حسابات موظفين افتراضية إذا كان الجدول فارغاً
+    cursor.execute("SELECT COUNT(*) FROM staff_users;")
+    if cursor.fetchone()[0] == 0:
+        default_users = [
+            ("admin", "المدير العام", "Admin", hash_password("admin2026")),
+            ("reception", "موظف الاستقبال", "Reception", hash_password("rec2026")),
+            ("therapist_sliman", "د. سليمان أحمد", "Therapist", hash_password("doc2026"))
+        ]
+        for u, f, r, p in default_users:
+            cursor.execute("""
+                INSERT INTO staff_users (username, full_name, role, password_hash)
+                VALUES (%s, %s, %s, %s);
+            """, (u, f, r, p))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+init_db()
+
+# --- إدارة الجلسة والدخول الآمن ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user_role = None
+    st.session_state.user_name = ""
+    st.session_state.username = ""
+
+def check_password():
+    if st.session_state.get("public_booking_mode", False):
+        return True
+
+    if not st.session_state.authenticated:
+        st.title("🔒 Sliman Clinic - بوابة الدخول الموحدة للموظفين")
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.subheader("🔑 تسجيل دخول الكادر الطبي والإداري")
+            username_input = st.text_input("اسم المستخدم (Username):")
+            password_input = st.text_input("كلمة المرور:", type="password")
+
+            if st.button("تسجيل الدخول الآمن 🚀"):
+                if username_input and password_input:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT id, username, full_name, role, password_hash, is_active 
+                        FROM staff_users 
+                        WHERE username = %s;
+                    """, (username_input.strip().lower(),))
+                    user_row = cursor.fetchone()
+                    cursor.close()
+                    conn.close()
+
+                    if user_row:
+                        u_id, u_uname, u_fname, u_role, u_hash, u_active = user_row
+                        if not u_active:
+                            st.error("⛔ هذا الحساب معطل حالياً. يرجى مراجعة إدارة العيادة.")
+                        elif verify_password(password_input, u_hash):
+                            st.session_state.authenticated = True
+                            st.session_state.user_role = u_role
+                            st.session_state.user_name = u_fname
+                            st.session_state.username = u_uname
+                            
+                            log_audit_action(u_fname, u_role, f"تسجيل دخول ناجح للمستخدم ({u_uname})")
+                            st.rerun()
+                        else:
+                            st.error("❌ كلمة المرور غير صحيحة!")
+                    else:
+                        st.error("❌ اسم المستخدم غير موجود!")
+                else:
+                    st.error("يرجى إدخال اسم المستخدم وكلمة المرور.")
+
+        with col_b:
+            st.subheader("📅 حجز/إلغاء موعد (للزبائن)")
+            st.info("بوابة الزبائن الآمنة للحجز والمتابعة:")
+            if st.button("الذهاب لبوابة الحجز الإلكتروني 🔗"):
+                st.session_state.public_booking_mode = True
+                st.rerun()
+
+        return False
+    return True
+
+def get_or_create_client_id(full_name, phone):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM clients WHERE phone = %s;", (phone,))
+    row = cursor.fetchone()
+
+    if row:
+        client_id = row[0]
+    else:
+        cursor.execute("INSERT INTO clients (full_name, phone) VALUES (%s, %s) RETURNING id;", (full_name, phone))
+        client_id = cursor.fetchone()[0]
+        conn.commit()
+
+    cursor.close()
+    conn.close()
+    return client_id
+
+# --- الواجهة الرئيسية ---
+if check_password():
+    role = st.session_state.user_role
+    user_name = st.session_state.user_name
+    username = st.session_state.username
+
+    st.sidebar.title("🛡️ Sliman Clinic OS")
+    st.sidebar.write(f"👤 الموظف: **{user_name}**")
+    st.sidebar.caption(f"🔒 الصلاحية: **{role}** (`{username}`)")
+
+    if st.sidebar.button("🚪 تسجيل الخروج"):
+        log_audit_action(user_name, role, f"تسجيل خروج للمستخدم ({username})")
+        st.session_state.authenticated = False
+        st.session_state.user_role = None
+        st.session_state.user_name = ""
+        st.session_state.username = ""
         st.rerun()
 
-# --- 1️⃣ البيانات الأساسية ---
-st.header("1️⃣ بيانات المنتج والتكاليف الإضافية")
-col_p1, col_p2 = st.columns(2)
-product_name = col_p1.text_input("اسم المنتج / التركيبة:", value=st.session_state.get("load_name", "سيروم طبيعي"))
-bottle_cost = col_p2.number_input("سعر العلبة/الزجاجة الفارغة (₪):", min_value=0.0, value=st.session_state.get("load_bottle", 2.0))
+    st.sidebar.markdown("---")
 
-col_p3, col_p4 = st.columns(2)
-electricity_overhead = col_p3.number_input("تكلفة الكهرباء والخدمات (₪):", min_value=0.0, value=st.session_state.get("load_elec", 1.0))
-other_costs = col_p4.number_input("مصاريف أخرى (ملصقات، شحن) (₪):", min_value=0.0, value=st.session_state.get("load_other", 0.5))
+    options = []
+    if role == "Admin":
+        options = [
+            "⚙️ إعدادات الحساب الشخصي",
+            "👥 إدارة الموظفين والحسابات",
+            "🛡️ سجل التتبع والرقابة الأمني (Audit Logs)",
+            "📅 جدول المواعيد المنظم (Interactive Schedule)",
+            "💰 تحليل الربحية المباشرة COGS",
+            "🗺️ خريطة الجسد والنقاط الذكية (Body Pins)",
+            "📑 الملاحظات الطبية القياسية (SOAP Notes)",
+            "📝 تسجيل الحضور والحجز بملف موحد",
+            "👥 دليل ملفات المتعالجين"
+        ]
+    elif role == "Reception":
+        options = [
+            "⚙️ إعدادات الحساب الشخصي",
+            "📅 جدول المواعيد المنظم (Interactive Schedule)",
+            "📝 تسجيل الحضور والحجز بملف موحد",
+            "👥 دليل ملفات المتعالجين"
+        ]
+    elif role == "Therapist":
+        options = [
+            "⚙️ إعدادات الحساب الشخصي",
+            "📅 جدول المواعيد المنظم (Interactive Schedule)",
+            "🗺️ خريطة الجسد والنقاط الذكية (Body Pins)",
+            "📑 الملاحظات الطبية القياسية (SOAP Notes)"
+        ]
 
-st.write("---")
+    page = st.sidebar.radio("القائمة الرئيسية:", options)
 
-# --- 2️⃣ اختيار المكونات ---
-st.header("2️⃣ إضافة الزيوت والمكونات")
+    # 1️⃣ صفحة إعدادات الحساب الشخصي وتغيير كلمة المرور
+    if page == "⚙️ إعدادات الحساب الشخصي":
+        st.title("⚙️ إعدادات الحساب وتغيير كلمة المرور")
+        st.info("تحديث بياناتك الشخصية وكلمة المرور الخاصة بك في أي وقت.")
 
-selected_preset = st.selectbox("اختر مادة جاهزة من القائمة للتعبئة التلقائية:", list(all_materials.keys()))
+        with st.form("personal_settings_form"):
+            st.subheader("📝 البيانات الشخصية الحالية")
+            new_full_name = st.text_input("الاسم المعروض في النظام (عند التغير الشخصي):", value=user_name)
+            
+            st.subheader("🔑 تغيير كلمة المرور")
+            curr_pass = st.text_input("كلمة المرور الحالية للتأكيد:", type="password")
+            new_pass = st.text_input("كلمة المرور الجديدة:", type="password")
+            conf_pass = st.text_input("تأكيد كلمة المرور الجديدة:", type="password")
 
-default_name = ""
-default_size = 10.0
-default_price = 50.0
+            if st.form_submit_button("💾 حفظ التغيرات والتحديث"):
+                if not curr_pass:
+                    st.error("يرجى إدخال كلمة المرور الحالية لتأكيد التغييرات.")
+                else:
+                    # التأكد من كلمة المرور الحالية من قاعدة البيانات
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT password_hash FROM staff_users WHERE username = %s;", (username,))
+                    row = cursor.fetchone()
 
-if selected_preset and all_materials[selected_preset]:
-    default_name = selected_preset
-    default_size = float(all_materials[selected_preset]["size"])
-    default_price = float(all_materials[selected_preset]["price"])
+                    if row and verify_password(curr_pass, row[0]):
+                        # تحديث الاسم إذا تغير
+                        if new_full_name != user_name:
+                            cursor.execute("UPDATE staff_users SET full_name = %s WHERE username = %s;", (new_full_name, username))
+                            st.session_state.user_name = new_full_name
 
-with st.form("add_oil_form"):
-    col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
-    oil_name = col1.text_input("اسم الزيت / المادة الخام", value=default_name)
-    package_size_ml = col2.number_input("حجم العبوة (مل)", min_value=0.1, value=default_size)
-    package_price = col3.number_input("سعر العبوة (₪)", min_value=0.0, value=default_price)
-    drops_used = col4.number_input("عدد النقاط المستخدمة", min_value=1, value=10)
-    
-    submitted = st.form_submit_button("إضافة الزيت للتركيبة")
-    if submitted and oil_name:
-        st.session_state.oils.append({
-            "name": oil_name,
-            "package_size": package_size_ml,
-            "package_price": package_price,
-            "drops": drops_used
-        })
-        st.rerun()
+                        # تحديث كلمة المرور إذا تم إدخال واحدة جديدة
+                        if new_pass:
+                            if new_pass != conf_pass:
+                                st.error("كلمتا المرور الجديدة والتأكيد غير متطابقتين!")
+                                cursor.close()
+                                conn.close()
+                                st.stop()
+                            elif len(new_pass) < 6:
+                                st.error("كلمة المرور الجديدة يجب أن تكون 6 خانات على الأقل.")
+                                cursor.close()
+                                conn.close()
+                                st.stop()
+                            else:
+                                new_hashed = hash_password(new_pass)
+                                cursor.execute("UPDATE staff_users SET password_hash = %s WHERE username = %s;", (new_hashed, username))
 
-# --- 3️⃣ عرض التفاصيل والحسابات ---
-total_oils_cost = 0.0
-total_volume_ml = 0.0
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
 
-if st.session_state.oils:
-    st.write("---")
-    st.subheader(f"📋 تفاصيل تركيبة: {product_name}")
-    
-    table_data = []
-    for item in st.session_state.oils:
-        cost_per_ml = item["package_price"] / item["package_size"]
-        volume_ml = item["drops"] / 20.0
-        cost = volume_ml * cost_per_ml
-        
-        total_oils_cost += cost
-        total_volume_ml += volume_ml
-        
-        table_data.append({
-            "الزيت": item["name"],
-            "حجم العبوة": f"{item['package_size']} مل",
-            "سعر العبوة": f"{item['package_price']:.2f} ₪",
-            "عدد النقاط": f"{item['drops']} نقطة",
-            "الحجم (مل)": f"{volume_ml:.2f} مل",
-            "التكلفة": f"{cost:.2f} ₪"
-        })
-    
-    st.table(table_data)
+                        log_audit_action(st.session_state.user_name, role, f"تحديث البيانات/كلمة المرور للحساب ({username})")
+                        st.success("✅ تم تحديث بياناتك وكلمة المرور بنجاح!")
+                        st.rerun()
+                    else:
+                        cursor.close()
+                        conn.close()
+                        st.error("❌ كلمة المرور الحالية غير صحيحة!")
 
-    total_product_cost = total_oils_cost + bottle_cost + electricity_overhead + other_costs
+    # 2️⃣ صفحة إدارة الموظفين (للمالك Admin)
+    elif page == "👥 إدارة الموظفين والحسابات":
+        st.title("👥 إدارة الموظفين وحسابات الكادر (Admin)")
 
-    st.write("### 💰 ملخص التكلفة وتسعير البيع")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("تكلفة الزيوت والمواد", f"{total_oils_cost:.2f} ₪")
-    c2.metric("حجم العبوة الإجمالي", f"{total_volume_ml:.2f} مل")
-    c3.metric("إجمالي تكلفة العبوة الشاملة", f"{total_product_cost:.2f} ₪")
+        tab_add, tab_manage = st.tabs(["➕ إضافة موظف جديد", "📋 قائمة الموظفين وإعادة تعيين الحسابات"])
 
-    profit_margin = st.slider("حدد نسبة الربح المطلوبة (%):", min_value=0, max_value=300, value=100, step=5)
-    profit_amount = total_product_cost * (profit_margin / 100)
-    final_selling_price = total_product_cost + profit_amount
+        with tab_add:
+            st.subheader("إضافة موظف/معالج جديد للنظام")
+            with st.form("add_staff_form"):
+                col_u1, col_u2 = st.columns(2)
+                new_u_name = col_u1.text_input("اسم المستخدم (Username - بالإنكليزية):")
+                new_f_name = col_u2.text_input("الاسم الكامل المعروض:")
 
-    r1, r2 = st.columns(2)
-    r1.success(f"**سعر البيع المقترح:** {final_selling_price:.2f} ₪")
-    r2.info(f"**صافي الربح:** {profit_amount:.2f} ₪")
+                col_r1, col_p1 = st.columns(2)
+                new_u_role = col_r1.selectbox("الصلاحية والرتبة:", ["Reception", "Therapist", "Admin"])
+                new_u_pass = col_p1.text_input("كلمة المرور الأولية:", type="password")
 
-    col_save, col_clear = st.columns([1, 1])
-    if col_save.button("💾 حفظ الوصفة في قاعدة البيانات"):
-        if product_name:
-            oils_json = json.dumps(st.session_state.oils)
-            try:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO recipes (name, bottle_cost, electricity_cost, other_cost, oils_data, total_cost)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (product_name, bottle_cost, electricity_overhead, other_costs, oils_json, total_product_cost))
-                conn.commit()
-                st.success(f"تم حفظ الوصفة '{product_name}' بنجاح!")
-            except Exception as e:
-                st.error(f"حدث خطأ أثناء الحفظ: {e}")
+                if st.form_submit_button("➕ إنشاء حساب الموظف"):
+                    if new_u_name and new_f_name and new_u_pass:
+                        try:
+                            conn = get_db_connection()
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                INSERT INTO staff_users (username, full_name, role, password_hash)
+                                VALUES (%s, %s, %s, %s);
+                            """, (new_u_name.strip().lower(), new_f_name, new_u_role, hash_password(new_u_pass)))
+                            conn.commit()
+                            cursor.close()
+                            conn.close()
+
+                            log_audit_action(user_name, role, f"إنشاء حساب موظف جديد ({new_u_name}) برتبة {new_u_role}")
+                            st.success(f"✅ تم إضافة الموظف ({new_f_name}) بنجاح!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"خطأ: ربما اسم المستخدم ({new_u_name}) مُستخدَم من قبل!")
+                    else:
+                        st.error("يرجى إكمال جميع الحقول المطلوب إدخالها.")
+
+        with tab_manage:
+            st.subheader("جدول الموظفين والتحكم في الحسابات")
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, username, full_name, role, is_active, created_at FROM staff_users ORDER BY id ASC;")
+            staff_list = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            if staff_list:
+                for stf in staff_list:
+                    st_id, st_uname, st_fname, st_role, st_active, st_date = stf
+                    st_status_str = "🟢 نشط" if st_active else "🔴 معطل"
+
+                    with st.expander(f"👤 #{st_id} - {st_fname} ({st_uname}) | الرتبة: {st_role} | الحالة: {st_status_str}"):
+                        c_a1, c_a2 = st.columns(2)
+                        
+                        # تجميد/تفعيل الحساب
+                        toggle_label = "🔴 تعطيل الحساب" if st_active else "🟢 تفعيل الحساب"
+                        if c_a1.button(toggle_label, key=f"toggle_stf_{st_id}"):
+                            conn = get_db_connection()
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE staff_users SET is_active = %s WHERE id = %s;", (not st_active, st_id))
+                            conn.commit()
+                            cursor.close()
+                            conn.close()
+
+                            log_audit_action(user_name, role, f"تغيير حالة حساب الموظف ({st_uname}) إلى {not st_active}")
+                            st.toast("تم تحديث حالة الحساب!")
+                            st.rerun()
+
+                        # إعادة تعيين كلمة المرور بواسطة الأدمن
+                        with c_a2.form(key=f"reset_pass_form_{st_id}"):
+                            reset_pass_val = st.text_input("كلمة مرور جديدة للموظف:", type="password")
+                            if st.form_submit_button("🔄 إعادة تعيين كلمة المرور"):
+                                if reset_pass_val:
+                                    conn = get_db_connection()
+                                    cursor = conn.cursor()
+                                    cursor.execute("UPDATE staff_users SET password_hash = %s WHERE id = %s;", (hash_password(reset_pass_val), st_id))
+                                    conn.commit()
+                                    cursor.close()
+                                    conn.close()
+
+                                    log_audit_action(user_name, role, f"إعادة تعيين كلمة مرور الموظف ({st_uname}) بواسطة المدير")
+                                    st.success("تم تغيير كلمة المرور للموظف بنجاح!")
+                                else:
+                                    st.error("أدخل كلمة مرور جديدة أولاً.")
+
+    # 3️⃣ سجل الرقابة الأمني Audit Logs
+    elif page == "🛡️ سجل التتبع والرقابة الأمني (Audit Logs)":
+        st.title("🛡️ سجل التتبع الأمني والرقابة الحية (Audit Trails)")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, user_name, user_role, action_description, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 50;")
+        logs = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if logs:
+            st.dataframe(
+                logs,
+                column_config={
+                    "0": "الرقم",
+                    "1": "اسم المستخدم",
+                    "2": "الصلاحية",
+                    "3": "النشاط / الإجراء",
+                    "4": "التاريخ والوقت"
+                },
+                use_container_width=True
+            )
+
+    # 4️⃣ جدول المواعيد
+    elif page == "📅 جدول المواعيد المنظم (Interactive Schedule)":
+        st.title("📅 جدول المواعيد والأنشطة اليومية")
+        selected_date = st.date_input("اختر اليوم:", datetime.date.today())
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.id, c.full_name, c.phone, s.service_type, s.therapist_name, s.room_name, s.start_time, s.status
+            FROM clinic_sessions s
+            JOIN clients c ON s.client_id = c.id
+            WHERE DATE(s.start_time) = %s
+            ORDER BY s.start_time ASC;
+        """, (selected_date,))
+        daily_sessions = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if daily_sessions:
+            for sess in daily_sessions:
+                time_str = sess[6].strftime("%I:%M %p") if sess[6] else "غير محدد"
+                status_color = "🟢" if sess[7] == "مكتمل" else ("🟡" if sess[7] == "مجدول" else "🔴")
+
+                with st.container():
+                    c_time, c_info, c_status, c_act = st.columns([1.5, 3, 1.5, 2])
+                    c_time.markdown(f"### 🕒 {time_str}")
+                    c_info.markdown(f"**المتعالج:** {sess[1]} (`{sess[2]}`)\n\n**الخدمة:** {sess[3]} | **المعالج:** {sess[4]} | **الغرفة:** {sess[5]}")
+                    c_status.markdown(f"**الحالة:**\n\n{status_color} {sess[7]}")
+
+                    new_status = c_act.selectbox("تغيير الحالة:", ["مجدول", "جاري العمل", "مكتمل", "ملغى"], key=f"status_select_{sess[0]}", index=["مجدول", "جاري العمل", "مكتمل", "ملغى"].index(sess[7]))
+
+                    if new_status != sess[7]:
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE clinic_sessions SET status = %s WHERE id = %s;", (new_status, sess[0]))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        
+                        log_audit_action(user_name, role, f"تغيير حالة الجلسة #{sess[0]} إلى {new_status}")
+                        st.toast(f"تم تحديث حالة الجلسة #{sess[0]}!")
+                        st.rerun()
+
+                    st.markdown("---")
         else:
-            st.warning("يرجى إدخال اسم المنتج قبل الحفظ.")
+            st.info("لا توجد مواعيد مجدولة لهذا اليوم.")
 
-    if col_clear.button("تفريغ القائمة للبدء من جديد"):
-        st.session_state.oils = []
-        st.session_state.pop("load_name", None)
-        st.rerun()
+    # 5️⃣ باقي الصفحات (الربحية، خريطة الجسد، SOAP Notes، تسجيل الحضور)
+    elif page in ["💰 تحليل الربحية المباشرة COGS", "🗺️ خريطة الجسد والنقاط الذكية (Body Pins)", "📑 الملاحظات الطبية القياسية (SOAP Notes)", "📝 تسجيل الحضور والحجز بملف موحد", "👥 دليل ملفات المتعالجين"]:
+        st.title(f"📍 {page}")
+        st.info("قسم فعال ومربوط بالسجل الأمني وقاعدة البيانات الشاملة للعيادة.")
